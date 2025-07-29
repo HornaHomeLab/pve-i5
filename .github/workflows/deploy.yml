@@ -1,0 +1,135 @@
+name: Deploy Virtual Machines
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+
+jobs:
+  Terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+
+      - name: Terraform Format Check
+        run: cd ./terraform && terraform fmt -check
+
+      - name: Connect to On-Site environment
+        uses: StanislawHorna/Network/setup-site-link@main
+        with:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET_ID: ${{ secrets.TS_OAUTH_SECRET }}
+          VAULT_ROLE_ID: ${{ secrets.VAULT_GH_ROLE_ID }}
+          VAULT_SECRET_ID: ${{ secrets.VAULT_GH_SECRET_ID }}
+
+      - name: Terraform Init
+        run: cd ./terraform && terraform init
+
+      - name: Terraform Validate
+        run: cd ./terraform && terraform validate
+
+      - name: Terraform Plan
+        run: |
+          cd ./terraform \
+          && terraform plan \
+            -var "vault_role_id=${{ secrets.VAULT_TF_ROLE_ID }}" \
+            -var "vault_secret=${{ secrets.VAULT_TF_SECRET_ID }}" \
+            -out=tfplan
+
+      - name: Terraform Apply (auto-approve on push to main)
+        run: cd ./terraform && terraform apply -auto-approve tfplan
+
+      - name: Upload ansible inventory files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ansible-inventory
+          path: ./ansible/inventory/*
+          if-no-files-found: warn
+          retention-days: 1
+
+  Ansible:
+    runs-on: ubuntu-latest
+    needs: Terraform
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible sshpass
+
+      - name: Install hvac in Ansible's interpreter
+        run: |
+          /opt/pipx/venvs/ansible-core/bin/python -m pip install --upgrade pip
+          /opt/pipx/venvs/ansible-core/bin/python -m pip install hvac
+
+      - name: Connect to On-Site environment
+        uses: StanislawHorna/Network/setup-site-link@main
+        with:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET_ID: ${{ secrets.TS_OAUTH_SECRET }}
+          VAULT_ROLE_ID: ${{ secrets.VAULT_GH_ROLE_ID }}
+          VAULT_SECRET_ID: ${{ secrets.VAULT_GH_SECRET_ID }}
+
+      - name: Get secrets from Vault
+        id: vault
+        uses: hashicorp/vault-action@v2
+        with:
+          url: http://10.0.10.10:8200
+          method: approle
+          roleId: ${{ secrets.VAULT_TF_ROLE_ID }}
+          secretId: ${{ secrets.VAULT_TF_SECRET_ID }}
+          secrets: |
+            pki/cert/ca certificate | TLS_CRT
+
+      - name: Install internal CA certificate
+        run: |
+          echo "${{ steps.vault.outputs.TLS_CRT }}" > internal-root-ca.crt
+          sudo cp internal-root-ca.crt /usr/local/share/ca-certificates/internal-root-ca.crt
+          sudo update-ca-certificates
+
+      - name: Download inventory files
+        uses: actions/download-artifact@v4
+        with:
+          path: ./ansible/inventory
+          name: ansible-inventory
+
+      - name: Install Ansible dependencies
+        run: |
+          cd ./ansible \
+          && ansible-galaxy install -r ./collections/requirements.yml -f
+
+      - name: Run Ansible Playbook with default inventory
+        env:
+          ANSIBLE_HASHI_VAULT_ROLE_ID: ${{ secrets.VAULT_AN_ROLE_ID }}
+          ANSIBLE_HASHI_VAULT_SECRET_ID: ${{ secrets.VAULT_AN_SECRET_ID }}
+        run: |
+          cd ./ansible
+          for play in *.yml; do
+            if [[ $play != k3s* ]]; then
+              echo "⏳ Running $play"
+              ansible-playbook -i inventory/default.ini "$play"
+            fi
+          done
+
+      - name: Run Ansible Playbook to provision K3s clusters
+        env:
+          ANSIBLE_HASHI_VAULT_ROLE_ID: ${{ secrets.VAULT_AN_ROLE_ID }}
+          ANSIBLE_HASHI_VAULT_SECRET_ID: ${{ secrets.VAULT_AN_SECRET_ID }}
+        run: |
+          cd ./ansible
+          shopt -s nullglob
+          for file in inventory/k3s_cluster*.ini; do
+            echo "⏳ Running k3s playbook for inventory: $file"
+            ansible-playbook -i "$file" ./k3s_cluster_provisioning.yml
+          done
